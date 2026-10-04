@@ -33,6 +33,9 @@
     package let tablesByOrder: [String: Int]
     let foreignKeysByTableName: [String: [ForeignKey]]
     package let syncEngines = LockIsolated<SyncEngines>(SyncEngines())
+    // A retry lookup can overlap a native received deletion. Check its generation
+    // inside the writer transaction so stale lookup data cannot resurrect a row.
+    package let receivedDeletionGeneration = LockIsolated<UInt64>(0)
     package let defaultZone: CKRecordZone
     let delegate: (any SyncEngineDelegate)?
     let defaultSyncEngines:
@@ -1131,20 +1134,18 @@
       #endif
 
       let batch = await syncEngine.recordZoneChangeBatch(pendingChanges: changes) { recordID in
-        guard
-          let (metadata, allFields) = await withErrorReporting(
-            .sqliteDataCloudKitFailure,
-            catching: {
-              try await metadatabase.read { db in
-                try SyncMetadata
-                  .find(recordID)
-                  .select { ($0, $0._lastKnownServerRecordAllFields) }
-                  .fetchOne(db)
-              }
-            }
-          )
-            ?? nil
-        else {
+        let recordData: (SyncMetadata, CKRecord?)?
+        do {
+          recordData = try await metadatabase.read { db in
+            try SyncMetadata.find(recordID)
+              .select { ($0, $0._lastKnownServerRecordAllFields) }.fetchOne(db)
+          }
+        } catch {
+          // An unreadable record is not an absent record. Keep its pending save.
+          reportIssue(error)
+          return nil
+        }
+        guard let (metadata, allFields) = recordData else {
           syncEngine.state.remove(pendingRecordZoneChanges: [.saveRecord(recordID)])
           return nil
         }
@@ -1181,22 +1182,19 @@
           return nil
         }
         func open<T>(_: some SynchronizableTable<T>) async -> CKRecord? {
-          let row =
-            await withErrorReporting(.sqliteDataCloudKitFailure) {
-              // NB: Fake 'sending' result.
-              nonisolated(unsafe) var result: T.QueryOutput?
-              try await userDatabase.read { db in
-                result =
-                  try T
-                  .unscoped
-                  .where {
-                    #sql("\($0.primaryKey) = \(bind: metadata.recordPrimaryKey)")
-                  }
-                  .fetchOne(db)
-              }
-              return result
+          // The query output stays confined to the database reader; it is consumed
+          // only after that read completes, matching the existing isolation invariant.
+          nonisolated(unsafe) var row: T.QueryOutput?
+          do {
+            try await userDatabase.read { db in
+              row = try T.unscoped.where {
+                #sql("\($0.primaryKey) = \(bind: metadata.recordPrimaryKey)")
+              }.fetchOne(db)
             }
-            ?? nil
+          } catch {
+            reportIssue(error)
+            return nil
+          }
           guard let row
           else {
             syncEngine.state.remove(pendingRecordZoneChanges: [.saveRecord(recordID)])
@@ -1489,7 +1487,26 @@
         if let table = tablesByName[recordType] {
           func open<T>(_: some SynchronizableTable<T>) async {
             await withErrorReporting(.sqliteDataCloudKitFailure) {
-              try await userDatabase.write { db in
+              let pendingSaves = Set(syncEngine.state.pendingRecordZoneChanges.compactMap { change -> CKRecord.ID? in
+                if case .saveRecord(let id) = change { return id }
+                return nil
+              })
+              let movedChildren = try await userDatabase.write { db -> [CKRecord.ID] in
+                receivedDeletionGeneration.withValue { $0 &+= 1 }
+                let parentKeys = recordIDs.compactMap(\.recordPrimaryKey)
+                let children = try SyncMetadata.where {
+                  $0.parentRecordType.eq(recordType) && $0.parentRecordPrimaryKey.in(parentKeys.map(Optional.some))
+                }.fetchAll(db).compactMap { metadata -> CKRecord.ID? in
+                  let id = CKRecord.ID(recordName: metadata.recordName, zoneID: CKRecordZone.ID(zoneName: metadata.zoneName, ownerName: metadata.ownerName))
+                  guard syncEngine.database.databaseScope == .private,
+                    pendingSaves.contains(id),
+                    let key = foreignKeysByTableName[metadata.recordType]?.first,
+                    foreignKeysByTableName[metadata.recordType]?.count == 1,
+                    key.table == recordType, key.onDelete == .cascade,
+                    metadata.hasLastKnownServerRecord
+                  else { return nil }
+                  return id
+                }
                 try T
                   .unscoped
                   .where {
@@ -1505,7 +1522,13 @@
                   .findAll(recordIDs)
                   .delete()
                   .execute(db)
+                return children
               }
+              // A received deletion is authoritative. If a local move had not
+              // reached CloudKit, its old server child isn't under that parent
+              // yet, so it needs an explicit delete after the local cascade.
+              syncEngine.state.remove(pendingRecordZoneChanges: movedChildren.map { .saveRecord($0) })
+              syncEngine.state.add(pendingRecordZoneChanges: movedChildren.map { .deleteRecord($0) })
             }
           }
           await open(table)
@@ -1519,6 +1542,7 @@
           // NB: Deleting a record from a table we do not currently recognize.
           await withErrorReporting(.sqliteDataCloudKitFailure) {
             try await userDatabase.write { db in
+              receivedDeletionGeneration.withValue { $0 &+= 1 }
               try SyncMetadata
                 .findAll(recordIDs)
                 .delete()
@@ -1538,16 +1562,9 @@
             )
           }
           let modificationRecordIDs = Set(modifications.map(\.recordID))
-          let unsyncedRecordIDsToDelete = modificationRecordIDs.intersection(unsyncedRecordIDs)
+          // Successful upserts clear their own retry identities. Do not discard
+          // an import before validating and committing its record.
           unsyncedRecordIDs.subtract(modificationRecordIDs)
-          if !unsyncedRecordIDsToDelete.isEmpty {
-            try await userDatabase.write { db in
-              try UnsyncedRecordID
-                .findAll(unsyncedRecordIDsToDelete)
-                .delete()
-                .execute(db)
-            }
-          }
           let batchSize = 150
           let orderedUnsyncedRecordIDs = unsyncedRecordIDs.sorted {
             topologicallyAscending(
@@ -1563,14 +1580,14 @@
               .dropFirst(start)
               .prefix(batchSize)
             let results = try await syncEngine.database.records(for: Array(recordIDsBatch))
-            for (recordID, result) in results {
+            for result in results.values {
               switch result {
               case .success(let record):
                 unsyncedRecords.append(record)
               case .failure(let error as CKError) where error.code == .unknownItem:
-                try await userDatabase.write { db in
-                  try UnsyncedRecordID.find(recordID).delete().execute(db)
-                }
+                // Only an actual received deletion can discard this import.
+                // A temporarily absent record may be restored by another device.
+                continue
               case .failure:
                 continue
               }
@@ -1686,7 +1703,23 @@
         switch error.code {
         case .serverRecordChanged:
           guard let serverRecord = error.serverRecord else { continue }
-          await upsertFromServerRecord(serverRecord)
+          let carriesAssets = (failedRecord.allKeys() + serverRecord.allKeys()).contains {
+            failedRecord[$0] is CKAsset || serverRecord[$0] is CKAsset
+          }
+          if carriesAssets {
+            // Conflict payloads can lack usable asset contents. Download the
+            // complete record before merging required BLOB columns, rather
+            // than interpreting unavailable bytes as an intentional NULL.
+            let generation = receivedDeletionGeneration.value
+            let downloaded = await withErrorReporting(.sqliteDataCloudKitFailure) {
+              try await syncEngine.database.record(for: failedRecord.recordID)
+            }
+            if let downloaded {
+              await upsertFromServerRecord(downloaded, expectedDeletionGeneration: generation)
+            }
+          } else {
+            await upsertFromServerRecord(serverRecord)
+          }
           newPendingRecordZoneChanges.append(.saveRecord(failedRecord.recordID))
 
         case .zoneNotFound:
@@ -1711,57 +1744,35 @@
           else {
             continue
           }
-          func open<T>(_: some SynchronizableTable<T>) async throws {
+          // A failed parent reference is not a received server deletion. Never
+          // erase local user content here; a surviving private parent can be
+          // uploaded first. Real zone deletions still use the normal delete path.
+          func open<T>(_: some SynchronizableTable<T>) async throws -> CKRecord.ID? {
             try await userDatabase.write { db in
-              try $_isSynchronizingChanges.withValue(false) {
-                switch foreignKey.onDelete {
-                case .cascade:
-                  try T
-                    .unscoped
-                    .where { #sql("\($0.primaryKey) = \(bind: recordPrimaryKey)") }
-                    .delete()
-                    .execute(db)
-                case .restrict:
-                  preconditionFailure(
-                    "'RESTRICT' foreign key actions not supported for parent relationships."
-                  )
-                case .setDefault:
-                  guard
-                    let recordType = try RecordType.find(T.tableName).fetchOne(db),
-                    let columnInfo = recordType.tableInfo.first(where: {
-                      $0.name == foreignKey.from
-                    })
-                  else { return }
-                  let defaultValue = columnInfo.defaultValue ?? "NULL"
-                  try #sql(
-                    """
-                    UPDATE \(T.self)
-                    SET \(quote: foreignKey.from, delimiter: .identifier) = (\(raw: defaultValue))
-                    WHERE (\(T.primaryKey)) = (\(bind: recordPrimaryKey))
-                    """
-                  )
-                  .execute(db)
-                  break
-                case .setNull:
-                  try #sql(
-                    """
-                    UPDATE \(T.self)
-                    SET \(quote: foreignKey.from, delimiter: .identifier) = NULL
-                    WHERE (\(T.primaryKey)) = (\(bind: recordPrimaryKey))
-                    """
-                  )
-                  .execute(db)
-                case .noAction:
-                  preconditionFailure(
-                    "'NO ACTION' foreign key actions not supported for parent relationships."
-                  )
-                }
-              }
+              guard try T.unscoped.where({ #sql("\($0.primaryKey) = \(bind: recordPrimaryKey)") }).fetchOne(db) != nil
+              else { return nil }
+              guard syncEngine.database.databaseScope == .private,
+                let parentKey = try String.fetchOne(db, sql:
+                  "SELECT CAST(\"\(foreignKey.from.replacing("\"", with: "\"\""))\" AS TEXT) FROM \"\(T.tableName.replacing("\"", with: "\"\""))\" WHERE \"\(T.primaryKey.name.replacing("\"", with: "\"\""))\" = ?",
+                  arguments: [recordPrimaryKey])
+              else { return nil }
+              let parentID = CKRecord.ID(recordName: "\(parentKey):\(foreignKey.table)", zoneID: failedRecord.recordID.zoneID)
+              guard try SyncMetadata.find(parentID).fetchOne(db)?._isDeleted == false,
+                try Bool.fetchOne(db, sql:
+                  "SELECT EXISTS(SELECT 1 FROM \"\(foreignKey.table.replacing("\"", with: "\"\""))\" WHERE \"\(foreignKey.to.replacing("\"", with: "\"\""))\" = ?)",
+                  arguments: [parentKey]) == true
+              else { return nil }
+              try SyncMetadata.find(parentID).update { $0.setLastKnownServerRecord(nil) }.execute(db)
+              return parentID
             }
           }
-          await withErrorReporting(.sqliteDataCloudKitFailure) {
+          let parentID = await withErrorReporting(.sqliteDataCloudKitFailure) {
             try await open(table)
           }
+          if let parentID {
+            newPendingRecordZoneChanges.append(.saveRecord(parentID))
+          }
+          newPendingRecordZoneChanges.append(.saveRecord(failedRecord.recordID))
 
         case .permissionFailure:
           guard
@@ -1898,12 +1909,17 @@
       }
     }
 
-    private func upsertFromServerRecord(
+    func upsertFromServerRecord(
       _ serverRecord: CKRecord,
-      force: Bool = false
+      force: Bool = false,
+      expectedDeletionGeneration: UInt64? = nil
     ) async {
       await withErrorReporting(.sqliteDataCloudKitFailure) {
         try await userDatabase.write { db in
+          if let expectedDeletionGeneration,
+            receivedDeletionGeneration.value != expectedDeletionGeneration {
+            return
+          }
           upsertFromServerRecord(serverRecord, force: force, db: db)
         }
       }
@@ -1982,18 +1998,14 @@
               .update { $0.setLastKnownServerRecord(serverRecord) }
               .execute(db)
           } catch {
-            guard
-              let error = error as? DatabaseError,
-              error.resultCode == .SQLITE_CONSTRAINT,
-              error.extendedResultCode == .SQLITE_CONSTRAINT_FOREIGNKEY
-            else {
-              throw error
-            }
             try UnsyncedRecordID.insert {
               UnsyncedRecordID(recordID: serverRecord.recordID)
             } onConflictDoUpdate: { _ in
             }
             .execute(db)
+            if let constraint = error as? DatabaseError,
+               constraint.extendedResultCode == .SQLITE_CONSTRAINT_FOREIGNKEY { return }
+            throw error
           }
         }
         try open(table)
