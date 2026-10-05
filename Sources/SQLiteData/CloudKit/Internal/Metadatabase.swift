@@ -138,6 +138,22 @@
       )
       .execute(db)
     }
+    migrator.registerMigration("Durable import obligations") { db in
+      try db.execute(sql: """
+        CREATE INDEX sqlitedata_icloud_metadata_type_key ON sqlitedata_icloud_metadata(recordType, recordPrimaryKey);
+        CREATE TABLE sqlitedata_icloud_integrityProgress (tableName TEXT NOT NULL PRIMARY KEY, cursor TEXT NOT NULL) STRICT;
+        CREATE TABLE sqlitedata_icloud_schemaReplay (
+          recordName TEXT NOT NULL, zoneName TEXT NOT NULL, ownerName TEXT NOT NULL,
+          columnNames TEXT NOT NULL, expectedModificationTime INTEGER NOT NULL,
+          PRIMARY KEY(recordName, zoneName, ownerName)
+        ) STRICT;
+        CREATE TABLE sqlitedata_icloud_receivedDeletions (
+          recordName TEXT NOT NULL, zoneName TEXT NOT NULL, ownerName TEXT NOT NULL,
+          recordType TEXT NOT NULL,
+          PRIMARY KEY(recordName, zoneName, ownerName)
+        ) STRICT;
+        """)
+    }
     #if DEBUG
       try metadatabase.read { db in
         let hasSchemaChanges = try migrator.hasSchemaChanges(db)

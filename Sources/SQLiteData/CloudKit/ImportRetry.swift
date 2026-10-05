@@ -11,9 +11,22 @@ extension SyncEngine {
   /// Call from the application's coalesced fetch lane. Tokens are untouched.
   public func retryFailedImports() async throws {
     guard isRunning else { return }
+    try await replaySchemaChanges()
     let engines = syncEngines.withValue { [$0.private, $0.shared].compactMap { $0 } }
     for engine in engines {
       try Task.checkCancellation()
+      let deletions = try await metadatabase.read { db in
+        try Row.fetchAll(db, sql: "SELECT * FROM sqlitedata_icloud_receivedDeletions")
+          .compactMap { row -> (CKRecord.ID, String)? in
+            let owner: String = row["ownerName"]
+            guard (owner == CKCurrentUserDefaultName) == (engine.database.databaseScope == .private) else { return nil }
+            return (.init(recordName: row["recordName"], zoneID: .init(zoneName: row["zoneName"], ownerName: owner)), row["recordType"])
+          }
+      }
+      for offset in stride(from: 0, to: deletions.count, by: 100) {
+        try Task.checkCancellation()
+        await handleFetchedRecordZoneChanges(deletions: Array(deletions.dropFirst(offset).prefix(100)), syncEngine: engine)
+      }
       let ids = try await metadatabase.read { db in
         try UnsyncedRecordID.all.fetchAll(db)
           .map(CKRecord.ID.init(unsyncedRecordID:))
@@ -22,6 +35,7 @@ extension SyncEngine {
               == (engine.database.databaseScope == .private)
           }
       }.sorted { importOrder($0.tableName, $1.tableName) }
+      var retainedFailure: (any Error)?
       for start in stride(from: 0, to: ids.count, by: 150) {
         try Task.checkCancellation()
         let deletionGeneration = receivedDeletionGeneration.value
@@ -44,8 +58,15 @@ extension SyncEngine {
           guard isRunning else { throw CancellationError() }
           await upsertFromServerRecord(record, expectedDeletionGeneration: deletionGeneration)
         }
-        if let error = failure ?? recovery.failure { throw error }
+        if let error = failure ?? recovery.failure {
+          retainedFailure = retainedFailure ?? error
+          if let cloud = error as? CKError,
+            [.notAuthenticated, .accountTemporarilyUnavailable, .serviceUnavailable,
+             .requestRateLimited, .zoneBusy, .networkFailure, .networkUnavailable].contains(cloud.code) { throw error }
+        }
       }
+      try await replaySchemaChanges()
+      if let retainedFailure { throw retainedFailure }
     }
   }
 

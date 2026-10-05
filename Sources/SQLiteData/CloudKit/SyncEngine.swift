@@ -36,6 +36,9 @@
     // A retry lookup can overlap a native received deletion. Check its generation
     // inside the writer transaction so stale lookup data cannot resurrect a row.
     package let receivedDeletionGeneration = LockIsolated<UInt64>(0)
+    // If staging fails, retain the last durable cursor and stop. A fresh engine
+    // replays that cursor; continuing from the in-memory cursor would lose work.
+    package let unsafeImportScopes = LockIsolated<Set<CKDatabase.Scope>>([])
     package let defaultZone: CKRecordZone
     let delegate: (any SyncEngineDelegate)?
     let defaultSyncEngines:
@@ -456,6 +459,7 @@
 
     private func start() throws -> Task<Void, Never> {
       guard !isRunning else { return Task {} }
+      unsafeImportScopes.withValue { $0.removeAll() }
       observationRegistrar.withMutation(of: self, keyPath: \.isRunning) {
         syncEngines.withValue {
           let (privateSyncEngine, sharedSyncEngine) = defaultSyncEngines(metadatabase, self)
@@ -703,39 +707,19 @@
       previousRecordTypeByTableName: [String: RecordType],
       currentRecordTypeByTableName: [String: RecordType]
     ) async throws {
-      let tablesWithChangedSchemas = currentRecordTypeByTableName.filter { tableName, recordType in
-        previousRecordTypeByTableName[tableName]?.schema != recordType.schema
-      }
-
-      for (tableName, currentRecordType) in tablesWithChangedSchemas {
-        guard let table = tablesByName[tableName]
+      // Stage every changed row before caching the new table schema. Failed rows
+      // retain their affected columns, so later launches don't replay healthy rows.
+      for table in tables {
+        let tableName = table.base.tableName
+        guard let current = currentRecordTypeByTableName[tableName],
+          previousRecordTypeByTableName[tableName]?.schema != current.schema
         else { continue }
-        func open<T>(_ table: some SynchronizableTable<T>) async throws {
-          let previousRecordType = previousRecordTypeByTableName[tableName]
-          let changedColumns = currentRecordType.tableInfo.subtracting(
-            previousRecordType?.tableInfo ?? []
-          )
-          .map(\.name)
-          let lastKnownServerRecords = try await metadatabase.read { db in
-            try SyncMetadata
-              .where { $0.recordType.eq(tableName) }
-              .select(\._lastKnownServerRecordAllFields)
-              .fetchAll(db)
-          }
-          for case .some(let lastKnownServerRecord) in lastKnownServerRecords {
-            let query = try await updateQuery(
-              for: table,
-              record: lastKnownServerRecord,
-              columnNames: T.TableColumns.writableColumns.map(\.name),
-              changedColumnNames: changedColumns
-            )
-            try await userDatabase.write { db in
-              try #sql(query).execute(db)
-            }
-          }
-        }
-        try await open(table)
+        let columns = current.tableInfo.subtracting(
+          previousRecordTypeByTableName[tableName]?.tableInfo ?? []
+        ).map(\.name).sorted()
+        try await stageSchemaReplay(tableName: tableName, columns: columns)
       }
+      try await replaySchemaChanges()
     }
 
     package func tearDownSyncEngine() throws {
@@ -1373,6 +1357,8 @@
       stateSerialization: CKSyncEngine.State.Serialization,
       syncEngine: any SyncEngineProtocol
     ) async {
+      guard syncEngines.withValue({ $0.private === syncEngine || $0.shared === syncEngine }),
+        !unsafeImportScopes.value.contains(syncEngine.database.databaseScope) else { return }
       await withErrorReporting(.sqliteDataCloudKitFailure) {
         try await userDatabase.write { db in
           try StateSerialization.upsert {
@@ -1472,6 +1458,27 @@
       deletions: [(recordID: CKRecord.ID, recordType: CKRecord.RecordType)] = [],
       syncEngine: any SyncEngineProtocol
     ) async {
+      do {
+        try await metadatabase.write { db in
+          for record in modifications where tablesByName[record.recordType] != nil {
+            try UnsyncedRecordID.insert { UnsyncedRecordID(recordID: record.recordID) }
+              onConflictDoUpdate: { _ in }.execute(db)
+          }
+          for deletion in deletions {
+            try db.execute(sql: """
+              INSERT INTO sqlitedata_icloud_receivedDeletions
+                (recordName, zoneName, ownerName, recordType) VALUES (?, ?, ?, ?)
+              ON CONFLICT DO NOTHING
+              """, arguments: [deletion.recordID.recordName, deletion.recordID.zoneID.zoneName,
+                                 deletion.recordID.zoneID.ownerName, deletion.recordType])
+          }
+        }
+      } catch {
+        unsafeImportScopes.withValue { _ = $0.insert(syncEngine.database.databaseScope) }
+        reportIssue(error)
+        stop()
+        return
+      }
       let deletedRecordIDsByRecordType = OrderedDictionary(
         grouping: deletions.sorted { lhs, rhs in
           topologicallyAscending(
@@ -1518,10 +1525,8 @@
                   .delete()
                   .execute(db)
 
-                try UnsyncedRecordID
-                  .findAll(recordIDs)
-                  .delete()
-                  .execute(db)
+                try UnsyncedRecordID.findAll(recordIDs).delete().execute(db)
+                for id in recordIDs { try clearImportObligations(id, db: db) }
                 return children
               }
               // A received deletion is authoritative. If a local move had not
@@ -1543,10 +1548,11 @@
           await withErrorReporting(.sqliteDataCloudKitFailure) {
             try await userDatabase.write { db in
               receivedDeletionGeneration.withValue { $0 &+= 1 }
-              try SyncMetadata
-                .findAll(recordIDs)
-                .delete()
-                .execute(db)
+              try SyncMetadata.findAll(recordIDs).delete().execute(db)
+              for id in recordIDs {
+                try UnsyncedRecordID.find(id).delete().execute(db)
+                try clearImportObligations(id, db: db)
+              }
             }
           }
         }
@@ -1938,6 +1944,9 @@
           return
         }
 
+        if try SyncMetadata.find(serverRecord.recordID).fetchOne(db)?._isDeleted == true {
+          return
+        }
         try SyncMetadata.insert {
           SyncMetadata(
             recordPrimaryKey: recordPrimaryKey,
@@ -1989,8 +1998,11 @@
           }
 
           do {
-            try $_currentZoneID.withValue(serverRecord.recordID.zoneID) {
-              try #sql(upsert(table, record: serverRecord, columnNames: columnNames)).execute(db)
+            try $_isSynchronizingChanges.withValue(true) {
+              try $_currentZoneID.withValue(serverRecord.recordID.zoneID) {
+                let query = try upsert(table, record: serverRecord, columnNames: columnNames)
+              try #sql(query).execute(db)
+              }
             }
             try UnsyncedRecordID.find(serverRecord.recordID).delete().execute(db)
             try SyncMetadata
@@ -2005,7 +2017,9 @@
             .execute(db)
             if let constraint = error as? DatabaseError,
                constraint.extendedResultCode == .SQLITE_CONSTRAINT_FOREIGNKEY { return }
-            throw error
+            throw NSError(domain: "SQLiteData.Import", code: 1,
+              userInfo: [NSUnderlyingErrorKey: error, "SQLiteDataRecordName": serverRecord.recordID.recordName,
+                         "SQLiteDataOperation": "import"])
           }
         }
         try open(table)
@@ -2034,7 +2048,7 @@
       }
     }
 
-    private func updateQuery<T>(
+    package func updateQuery<T>(
       for _: some SynchronizableTable<T>,
       record: CKRecord,
       columnNames: some Collection<String>,
@@ -2051,7 +2065,7 @@
         return ""
       }
       var record = record
-      let recordHasAsset = nonPrimaryKeyChangedColumns.contains { columnName in
+      let recordHasAsset = columnNames.contains { columnName in
         record[columnName] is CKAsset
       }
       if recordHasAsset {
@@ -2062,14 +2076,11 @@
       query.append(columnNames.map { "\(quote: $0)" }.joined(separator: ", "))
       query.append(") VALUES (")
       query.append(
-        columnNames
+        try columnNames
           .map { columnName in
             if let asset = record[columnName] as? CKAsset {
-              let data = try? asset.fileURL.map { try dataManager.wrappedValue.load($0) }
-              if data == nil {
-                reportIssue("Asset data not found on disk")
-              }
-              return data?.queryFragment ?? "NULL"
+              guard let url = asset.fileURL else { throw ImportAssetUnavailable() }
+              return try dataManager.wrappedValue.load(url).queryFragment
             } else {
               return record.encryptedValues[columnName]?.queryFragment ?? "NULL"
             }
@@ -2079,15 +2090,12 @@
       query.append(") ON CONFLICT(\(quote: T.primaryKey.name)) DO UPDATE SET ")
       query.append(" ")
       query.append(
-        nonPrimaryKeyChangedColumns
+        try nonPrimaryKeyChangedColumns
           .map { columnName in
             if let asset = record[columnName] as? CKAsset {
-              let data = try? asset.fileURL.map { try dataManager.wrappedValue.load($0) }
-              if data == nil {
-                reportIssue("Asset data not found on disk")
-              }
-              return
-                "\(quote: columnName) = \(data?.queryFragment ?? #""excluded".\#(quote: columnName)"#)"
+              guard let url = asset.fileURL else { throw ImportAssetUnavailable() }
+              let data = try dataManager.wrappedValue.load(url)
+              return "\(quote: columnName) = \(data.queryFragment)"
             } else {
               return """
                 \(quote: columnName) = \
@@ -2480,7 +2488,7 @@
     _: some SynchronizableTable<T>,
     record: CKRecord,
     columnNames: some Collection<String>
-  ) -> QueryFragment {
+  ) throws -> QueryFragment {
     let setColumnNames = T.TableColumns.writableColumns.map(\.name)
       .filter { record.hasSet(key: $0) }
     guard !setColumnNames.isEmpty
@@ -2493,12 +2501,12 @@
     query.append(setColumnNames.map { "\(quote: $0)" }.joined(separator: ", "))
     query.append(") VALUES (")
     query.append(
-      setColumnNames
+      try setColumnNames
         .map { columnName in
           if let asset = record[columnName] as? CKAsset {
             @Dependency(\.dataManager) var dataManager
-            return (try? asset.fileURL.map { try dataManager.load($0) })?
-              .queryFragment ?? "NULL"
+            guard let url = asset.fileURL else { throw ImportAssetUnavailable() }
+            return try dataManager.load(url).queryFragment
           } else {
             return record.encryptedValues[columnName]?.queryFragment ?? "NULL"
           }
