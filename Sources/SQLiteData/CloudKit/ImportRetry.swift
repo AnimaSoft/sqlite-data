@@ -52,6 +52,9 @@ extension SyncEngine {
           case .failure(let error): failure = failure ?? error
           }
         }
+        if let cloud = failure as? CKError,
+          [.notAuthenticated, .accountTemporarilyUnavailable, .serviceUnavailable,
+           .requestRateLimited, .zoneBusy, .networkFailure, .networkUnavailable].contains(cloud.code) { throw cloud }
         let recovery = try await recordsWithMissingDependencies(records, engine: engine)
         for record in recovery.records.sorted(by: { importOrder($0.recordType, $1.recordType) }) {
           try Task.checkCancellation()
@@ -130,6 +133,9 @@ extension SyncEngine {
           case .failure(let error): failure = failure ?? error
           }
         }
+        if let cloud = failure as? CKError,
+          [.notAuthenticated, .accountTemporarilyUnavailable, .serviceUnavailable,
+           .requestRateLimited, .zoneBusy, .networkFailure, .networkUnavailable].contains(cloud.code) { throw cloud }
       }
       if failure != nil { break }
     }
