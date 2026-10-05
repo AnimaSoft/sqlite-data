@@ -92,12 +92,25 @@ extension SyncEngine {
           }
           guard let record = metadata._lastKnownServerRecordAllFields else { continue }
           func open<T>(_ table: some SynchronizableTable<T>) async throws {
+            guard let primaryKey = id.recordPrimaryKey else { return }
+            let exists = try await userDatabase.read { db in
+              try T.unscoped.find(#sql("\(bind: primaryKey)")).fetchOne(db) != nil
+            }
+            guard exists else {
+              // Cached schema values cannot establish that an absent row still
+              // exists on the server. Retain a current-server lookup obligation.
+              try await metadatabase.write { db in
+                try UnsyncedRecordID.insert { UnsyncedRecordID(recordID: id) } onConflictDoUpdate: { _ in }.execute(db)
+              }
+              return
+            }
             let query = try await updateQuery(for: table, record: record,
               columnNames: T.TableColumns.writableColumns.map(\.name), changedColumnNames: columns)
             try await userDatabase.write { db in
               // Replay never overwrites a row edited since the obligation was staged.
               if let latest = try SyncMetadata.find(id).fetchOne(db), !latest._isDeleted,
-                latest.userModificationTime == expected {
+                latest.userModificationTime == expected,
+                try T.unscoped.find(#sql("\(bind: primaryKey)")).fetchOne(db) != nil {
                 try $_isSynchronizingChanges.withValue(true) {
                   try $_currentZoneID.withValue(id.zoneID) { try #sql(query).execute(db) }
                 }

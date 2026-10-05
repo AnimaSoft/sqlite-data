@@ -870,6 +870,8 @@
             privateTables: syncEngine.privateTables
           )
           defer { _ = relaunchedSyncEngine }
+          // New tables verify current server state before creating absent rows.
+          try await relaunchedSyncEngine.retryFailedImports()
 
           try await userDatabase.read { db in
             expectNoDifference(

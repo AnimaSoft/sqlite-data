@@ -277,6 +277,32 @@ struct GigsImportRetryTests {
     #expect(try await fixture.syncEngine.checkImportIntegrity() == 0)
   }
 
+  @MainActor @Test func schemaReplayNeverRestoresAnAbsentRowFromCachedContent() async throws {
+    let fixture = try await BaseCloudKitTests()
+    let id = RemindersList.recordID(for: 1)
+    let record = CKRecord(recordType: RemindersList.tableName, recordID: id)
+    record.setValue(1, forKey: "id", at: 0)
+    record.setValue("Old cached value", forKey: "title", at: 0)
+    try await fixture.syncEngine.modifyRecords(scope: .private, saving: [record]).notify()
+    try await fixture.userDatabase.write { db in
+      try db.execute(sql: "DROP TRIGGER IF EXISTS sqlitedata_icloud_after_delete_on_remindersLists_from_sync_engine")
+      try $_isSynchronizingChanges.withValue(true) { try RemindersList.find(1).delete().execute(db) }
+      try db.execute(sql: "UPDATE sqlitedata_icloud_metadata SET _isDeleted = 0 WHERE recordType = 'remindersLists'")
+    }
+    // The server has newer content, while the acknowledged payload is stale.
+    let current = try fixture.container.privateCloudDatabase.record(for: id)
+    current.setValue("Current server value", forKey: "title", at: 60)
+    _ = try fixture.syncEngine.modifyRecords(scope: .private, saving: [current])
+    try await fixture.syncEngine.stageSchemaReplay(tableName: RemindersList.tableName, columns: ["title"])
+    try await fixture.syncEngine.replaySchemaChanges()
+    try await fixture.syncEngine.replaySchemaChanges()
+    #expect(try await fixture.userDatabase.read { try RemindersList.count().fetchOne($0) } == 0)
+    #expect(try await fixture.syncEngine.metadatabase.read { try UnsyncedRecordID.count().fetchOne($0) } == 1)
+    try await fixture.syncEngine.retryFailedImports()
+    let restored = try await fixture.userDatabase.read { try RemindersList.find(1).fetchOne($0) }
+    #expect(restored?.title == "Current server value")
+  }
+
   @MainActor @Test func unavailableAssetKeepsExistingBytesAndPendingImport() async throws {
     let fixture = try await BaseCloudKitTests()
     try await fixture.userDatabase.userWrite { db in
