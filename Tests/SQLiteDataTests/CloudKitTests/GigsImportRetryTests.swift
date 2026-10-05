@@ -379,5 +379,41 @@ struct GigsImportRetryTests {
     #expect(try await fixture.userDatabase.read { try RemindersList.count().fetchOne($0) } == 1)
   }
 
+  @MainActor @Test func schemaReplayServiceFailureRetainsObligationsAndPropagatesFromRetry() async throws {
+    let fixture = try await BaseCloudKitTests()
+    try await fixture.userDatabase.userWrite { db in
+      try db.seed {
+        RemindersList(id: 1, title: "One")
+        RemindersList(id: 2, title: "Two")
+        RemindersListAsset(remindersListID: 1, coverImage: Data("one".utf8))
+        RemindersListAsset(remindersListID: 2, coverImage: Data("two".utf8))
+      }
+    }
+    try await fixture.syncEngine.processPendingRecordZoneChanges(scope: .private)
+    try await fixture.syncEngine.stageSchemaReplay(tableName: RemindersListAsset.tableName, columns: ["coverImage"])
+    await fixture.softSignOut()
+    await withKnownIssue { try await fixture.syncEngine.replaySchemaChanges() }
+    #expect(try await fixture.syncEngine.metadatabase.read {
+      try Int.fetchOne($0, sql: "SELECT count(*) FROM sqlitedata_icloud_schemaReplay")
+    } == 2)
+    var receivedCode: CKError.Code?
+    await withKnownIssue {
+      do {
+        try await fixture.syncEngine.retryFailedImports()
+      } catch let error as CKError {
+        receivedCode = error.code
+      }
+    }
+    #expect(receivedCode == .accountTemporarilyUnavailable)
+    #expect(fixture.syncEngine.isRunning)
+    fixture.container._accountStatus.withValue { $0 = .available }
+    try await fixture.syncEngine.retryFailedImports()
+    #expect(try await fixture.syncEngine.metadatabase.read {
+      try Int.fetchOne($0, sql: "SELECT count(*) FROM sqlitedata_icloud_schemaReplay")
+    } == 0)
+    #expect(try await fixture.userDatabase.read { try RemindersListAsset.find(1).fetchOne($0)?.coverImage } == Data("one".utf8))
+    #expect(try await fixture.userDatabase.read { try RemindersListAsset.find(2).fetchOne($0)?.coverImage } == Data("two".utf8))
+  }
+
 }
 #endif

@@ -60,7 +60,7 @@ extension SyncEngine {
     }
   }
 
-  package func replaySchemaChanges() async throws {
+  package func replaySchemaChanges(propagateServiceErrors: Bool = false) async throws {
     var cursor = ("", "", "")
     while true {
       try Task.checkCancellation()
@@ -108,9 +108,13 @@ extension SyncEngine {
               columnNames: T.TableColumns.writableColumns.map(\.name), changedColumnNames: columns)
             try await userDatabase.write { db in
               // Replay never overwrites a row edited since the obligation was staged.
-              if let latest = try SyncMetadata.find(id).fetchOne(db), !latest._isDeleted,
-                latest.userModificationTime == expected,
-                try T.unscoped.find(#sql("\(bind: primaryKey)")).fetchOne(db) != nil {
+              guard let latest = try SyncMetadata.find(id).fetchOne(db) else { return }
+              if !latest._isDeleted,
+                try T.unscoped.find(#sql("\(bind: primaryKey)")).fetchOne(db) == nil {
+                try UnsyncedRecordID.insert { UnsyncedRecordID(recordID: id) } onConflictDoUpdate: { _ in }.execute(db)
+                return
+              }
+              if !latest._isDeleted, latest.userModificationTime == expected {
                 try $_isSynchronizingChanges.withValue(true) {
                   try $_currentZoneID.withValue(id.zoneID) { try #sql(query).execute(db) }
                 }
@@ -125,6 +129,14 @@ extension SyncEngine {
           reportIssue(NSError(domain: "SQLiteData.SchemaReplay", code: 1,
             userInfo: [NSUnderlyingErrorKey: error, "SQLiteDataRecordName": name,
                        "SQLiteDataOperation": "schemaReplay"]))
+          if let cloud = error as? CKError,
+            [.notAuthenticated, .accountTemporarilyUnavailable, .serviceUnavailable,
+             .requestRateLimited, .zoneBusy, .networkFailure, .networkUnavailable].contains(cloud.code) {
+            // Initialization must still cache healthy tables. Explicit retry
+            // propagates service errors so the app can honor the server deadline.
+            if propagateServiceErrors { throw error }
+            return
+          }
         }
       }
       await Task.yield()

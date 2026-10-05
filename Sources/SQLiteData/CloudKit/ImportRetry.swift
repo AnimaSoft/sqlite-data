@@ -11,7 +11,7 @@ extension SyncEngine {
   /// Call from the application's coalesced fetch lane. Tokens are untouched.
   public func retryFailedImports() async throws {
     guard isRunning else { return }
-    try await replaySchemaChanges()
+    try await replaySchemaChanges(propagateServiceErrors: true)
     let engines = syncEngines.withValue { [$0.private, $0.shared].compactMap { $0 } }
     for engine in engines {
       try Task.checkCancellation()
@@ -65,7 +65,7 @@ extension SyncEngine {
              .requestRateLimited, .zoneBusy, .networkFailure, .networkUnavailable].contains(cloud.code) { throw error }
         }
       }
-      try await replaySchemaChanges()
+      try await replaySchemaChanges(propagateServiceErrors: true)
       if let retainedFailure { throw retainedFailure }
     }
   }

@@ -17,3 +17,5 @@ A received known record is queued before user-database writes. A staging failure
 Removal criteria: unmodified upstream must pass `GigsImportRetryTests` including schema replay across restart, staged import failure, received deletion rollback, current-server integrity recovery, and missing asset preservation, alongside schema/asset/reference/upgrade suites and app regressions. These changes have no Gigs-specific tables or duplicate policy.
 
 Schema replay never recreates an absent local row from a cached payload. It retains a current-server lookup obligation; new synchronized tables import their existing records through the normal retry path. The schema upgrade fixture exercises this extra verification step.
+
+Schema asset replay stops a pass on account, service, network, or throttling failures without discarding obligations. Initialization continues caching healthy tables; explicit recovery propagates the original CloudKit error and retry deadline. A row disappearing during replay is retained for current-server verification.
