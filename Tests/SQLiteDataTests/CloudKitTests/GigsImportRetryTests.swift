@@ -277,6 +277,25 @@ struct GigsImportRetryTests {
     #expect(try await fixture.syncEngine.checkImportIntegrity() == 0)
   }
 
+  @MainActor @Test func malformedRecordIsRetainedUntilAValidRevisionArrives() async throws {
+    let fixture = try await BaseCloudKitTests()
+    let malformed = CKRecord(recordType: RemindersList.tableName, recordID: RemindersList.recordID(for: 1))
+    malformed["id"] = 1
+    malformed["title"] = "Incomplete"
+    let healthy = CKRecord(recordType: RemindersList.tableName, recordID: RemindersList.recordID(for: 2))
+    healthy.setValue(2, forKey: "id", at: 0)
+    healthy.setValue("Healthy", forKey: "title", at: 0)
+    await fixture.syncEngine.handleFetchedRecordZoneChanges(modifications: [malformed, healthy], syncEngine: fixture.syncEngine.private)
+    #expect(try await fixture.syncEngine.metadatabase.read { try UnsyncedRecordID.count().fetchOne($0) } == 1)
+    #expect(try await fixture.userDatabase.read { try RemindersList.find(2).fetchOne($0)?.title } == "Healthy")
+    let corrected = CKRecord(recordType: RemindersList.tableName, recordID: malformed.recordID)
+    corrected.setValue(1, forKey: "id", at: 60)
+    corrected.setValue("Complete", forKey: "title", at: 60)
+    await fixture.syncEngine.handleFetchedRecordZoneChanges(modifications: [corrected], syncEngine: fixture.syncEngine.private)
+    #expect(try await fixture.syncEngine.metadatabase.read { try UnsyncedRecordID.count().fetchOne($0) } == 0)
+    #expect(try await fixture.userDatabase.read { try RemindersList.find(1).fetchOne($0)?.title } == "Complete")
+  }
+
   @MainActor @Test func schemaReplayNeverRestoresAnAbsentRowFromCachedContent() async throws {
     let fixture = try await BaseCloudKitTests()
     let id = RemindersList.recordID(for: 1)

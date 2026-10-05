@@ -124,9 +124,11 @@
           recordType: ScopedModel.tableName,
           recordID: ScopedModel.recordID(for: 1)
         )
-        serverRecord["id"] = 1
-        serverRecord["title"] = "from-server"
-        serverRecord["isDeleted"] = 1
+        // Native SQLiteData records include encrypted modification timestamps.
+        // Malformed records are now retained instead of silently discarded.
+        serverRecord.setValue(1, forKey: "id", at: now)
+        serverRecord.setValue("from-server", forKey: "title", at: now)
+        serverRecord.setValue(1, forKey: "isDeleted", at: now)
         await syncEngine.handleEvent(
           SyncEngine.Event.fetchedRecordZoneChanges(
             modifications: [serverRecord],
